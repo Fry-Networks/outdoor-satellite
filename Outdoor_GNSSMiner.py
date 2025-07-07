@@ -13,7 +13,11 @@ import serial.tools.list_ports
 from time import sleep
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+import requests
+import schedule
+import psutil
 
+url = 'https://airback.frynetworks.com/api/submitHDMiner'
 alreadyTriedPorts = []
 
 
@@ -28,12 +32,19 @@ def find_available_serial_port():
 
 
 def open_serial_connection(port, baudrate=9600, timeout=1):
+    print("Opened serial port:", port)
     try:
+        print("Opened serial port:", baudrate)
         ser = serial.Serial(port=port, baudrate=baudrate, timeout=timeout)
         return ser
     except serial.SerialException:
         return None
 
+def read_miner_key():
+    miner_key_file = f"minerkey.txt"
+    with open(miner_key_file, 'r') as f:
+        lines = f.read().splitlines()
+    return ''.join(lines)
 
 # Function to decrypt config file
 def owen_decrypt(key, ciphertext):
@@ -55,13 +66,16 @@ def decrypt_config():
     config = json.loads(cipher.decrypt(ec))
     return config
 
-
+mac_list = []
+miner_key = read_miner_key()
 config = decrypt_config()
-config_port = config['serial_port']
+# config_port = config['serial_port']
+config_port = find_available_serial_port()
 ports = serial.tools.list_ports.comports()
 # ser = serial.Serial(port="COM4", baudrate=9600, timeout=1)
 
 ser = open_serial_connection(config_port)
+# print(f"[!] Could not open port: {config}")
 alreadyTriedPorts.append(config_port)
 
 
@@ -105,35 +119,64 @@ if ser:
 
 # Get MAC address
 mac = '-'.join(['{:02x}'.format((uuid.getnode() >> i) & 0xff) for i in range(0, 8 * 6, 8)][::-1])
-
+addrs = psutil.net_if_addrs()
+for iface, addr_list in addrs.items():
+    for addr in addr_list:
+        if addr.family == psutil.AF_LINK:
+            mac_list.append(addr.address)
 
 def write_to_log(data, current_file):
     now = datetime.datetime.now()
     with open(current_file, 'a') as f:
-        f.write(f"{now.strftime('%H:%M:%S')} - {data}\n")
-
+        # f.write(f"{now.strftime('%H:%M:%S')} - {data}\n")
+        f.write(f"{data}\n")
 
 def upload_to_sftp(current_file):
     remote_filename = f"/home/fryscrypto/outdoor_gnss/{current_file}"
     cnopts = pysftp.CnOpts()
     cnopts.hostkeys = None  # Disable host key checking.
-    with pysftp.Connection(config['host'], username=config['username'], password=config['password'],
+    with pysftp.Connection("23.19.26.198", username="devdoctor", password="wtf.7001",
                            cnopts=cnopts) as sftp:
         sftp.put(current_file, remote_filename)
     os.remove(current_file)
 
+def fetch_data():
+    now = datetime.datetime.now()
+    last_upload_minute = now.minute
+    current_file = f"FRYgnss_{miner_key}_{now.strftime('%m%d%Y_%H%M%S')}.log"
 
-now = datetime.datetime.now()
-current_file = f"FRYgnss_{mac}_{now.strftime('%m%d%Y_%H%M%S')}.log"
+    while True:
+        data = ser.readline().decode('utf-8').strip()
+        if data:  # if data is not empty
+            
+            write_to_log(data, current_file)
+            now = datetime.datetime.now()
 
-last_upload_hour = now.hour
+            print(f"[_] Received: {data} {now.minute}")
+
+            if now.minute != last_upload_minute:
+
+                upload_to_sftp(current_file)
+                # Convert the log file to a list
+                try:
+                    body = {
+                        'data': miner_key,
+                        'deviceMac': mac_list
+                    }
+                    response = requests.post(url, json=body)
+
+                    if response.status_code == 200:
+                        print(response.json())
+                    else:
+                        print(f"Error: {response.status_code}")
+                except requests.exceptions.RequestException as e:
+                    print(f"An error occurred: {e}")
+
+                current_file = f"FRYgnss_{miner_key}_{now.strftime('%m%d%Y_%H%M%S')}.log"
+                break
+
+schedule.every(10).minutes.do(fetch_data)
+
 while True:
-    data = ser.readline().decode('utf-8').strip()
-    if data:  # if data is not empty
-        print(f"[_] Received: {data}")
-        write_to_log(data, current_file)
-        now = datetime.datetime.now()
-        if now.hour != last_upload_hour:
-            upload_to_sftp(current_file)
-            last_upload_hour = now.hour
-            current_file = f"FRYgnss_{mac}_{now.strftime('%m%d%Y_%H%M%S')}.log"
+    schedule.run_pending()
+    sleep(1)
